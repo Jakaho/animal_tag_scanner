@@ -10,26 +10,25 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
-import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
+import com.example.animaltag.*
 import com.google.android.gms.maps.model.LatLng
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.IOException
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
-import java.util.*
-import com.example.animaltag.*
-import java.io.IOException
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import java.util.*
 
 
 private const val TAG = "BluetoothService"
@@ -43,9 +42,15 @@ const val SERVICE_UUID = "00000001-8334-4397-af7e-bfca78d70c67"
 
 const val SENSOR_READ = "00000002-8334-4397-af7e-bfca78d70c67"
 const val STEP_COUNTER_UUID = "00000003-8334-4397-af7e-bfca78d70c67"
+private var lastStepCount: Int = 0
+
+
 
 const val SERVER_ADDRESS = "185.189.48.110"
 const val PORT = 8772
+private var pendingCharacteristicNotifications = LinkedList<UUID>()
+private var isProcessingCharacteristicNotification = false
+
 
 
 data class UiScanResult(val scanResult: ScanResult, val steps: Int, val udpMessage: JSONObject)
@@ -54,8 +59,10 @@ class BluetoothService(bluetoothAdapter: BluetoothAdapter, private val context: 
     var file: File? = null
     var tagId = ""
     var steps = 0
+    var stepCount = 0
 
-//    Old code
+
+    //    Old code
     private val leScanner = bluetoothAdapter.bluetoothLeScanner
 
     private var currentPosition: LatLng = LatLng(0.0, 0.0)
@@ -306,107 +313,100 @@ class BluetoothService(bluetoothAdapter: BluetoothAdapter, private val context: 
             }
         }
 
-        override fun onDescriptorWrite(
-            gatt: BluetoothGatt?,
-            descriptor: BluetoothGattDescriptor?,
-            status: Int
-        ) {
-            with(descriptor) {
-                when (status) {
-                    BluetoothGatt.GATT_SUCCESS -> {
-                        Log.i(
-                            "onDescriptorWrite",
-                            "Read descriptor ${this?.uuid}:\n${this?.value?.toHexString()}"
-                        )
-                    }
+        override fun onDescriptorWrite(gatt: BluetoothGatt?, descriptor: BluetoothGattDescriptor?, status: Int) {
+            // Existing logging and handling code...
 
-                    BluetoothGatt.GATT_READ_NOT_PERMITTED -> {
-                        Log.e(
-                            "onDescriptorWrite",
-                            " Descriptor read not permitted for ${this?.uuid}!"
-                        )
-                    }
-
-                    else -> {
-                        Log.e(
-                            "BluetoothGattCallback",
-                            "Descriptorread failed for ${this?.uuid}, error: $status"
-                        )
-                    }
+            // After handling the descriptor write, process the next characteristic
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.i(TAG, "Successfully enabled notifications for ${descriptor?.characteristic?.uuid}")
+                // Check if there are more characteristics to process
+                if (pendingCharacteristicNotifications.isNotEmpty()) {
+                    gatt?.let { processNextCharacteristicForNotification(it) }
+                } else {
+                    isProcessingCharacteristicNotification = false
+                    Log.d(TAG, "All notifications enabled")
                 }
+            } else {
+                Log.e(TAG, "Failed to write descriptor ${descriptor?.uuid} for characteristic ${descriptor?.characteristic?.uuid}")
+                // Optionally retry or handle error
             }
         }
 
-        override fun onCharacteristicChanged(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic
-        ) {
-            with(characteristic) {
-                Log.i(
-                    "onCharacteristicChanged",
-                    "Characteristic $uuid changed | value: ${value.size}"
-                )
+        // Example helper function to convert byte array to hex string
+        fun ByteArray.toHexString(): String = joinToString(separator = " ") { byte -> "%02x".format(byte) }
 
+
+        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+            Log.d(TAG, "Characteristic changed: ${characteristic.uuid}, Value size: ${characteristic.value.size}")
+
+            if (STEP_COUNTER_UUID.equals(characteristic.uuid.toString(), ignoreCase = true)) {
+                // Process step count characteristic
+                characteristic.value?.let { value ->
+                    if (value.size >= 2) {
+                        val stepCount = (value[0].toInt() and 0xFF) or ((value[1].toInt() and 0xFF) shl 8)
+                        Log.d(TAG, "Step count updated: $stepCount")
+                        lastStepCount = stepCount // Update the last step count
+                    }
+                }
+            } else if (SENSOR_READ.equals(characteristic.uuid.toString(), ignoreCase = true)) {
+                // Process sensor read characteristic and log it with the current step count
                 var shortArray = ShortArray(0)
-                for (i in 0 until value.size step 4) {
-                    val a = value[i].toUByte()
-                    val b = value[i + 1].toUByte()
-                    val c = value[i + 2].toUByte()
-                    val d = value[i + 3].toUByte()
+                for (i in 0 until characteristic.value.size step 4) {
+                    val a = characteristic.value[i].toUByte()
+                    val b = characteristic.value[i + 1].toUByte()
+                    val c = characteristic.value[i + 2].toUByte()
+                    val d = characteristic.value[i + 3].toUByte()
                     shortArray = shortArray.plus(decomp(a, b, c, d))
                 }
 
-//                Foal alarm: create data string
-                val csvData = "$tagId,$steps,${Date().time},\"${shortArray.joinToString(",")}\""
-
-//                Foal alarm: append data to file if not null
+                // Always log sensor data changes, including the current step count
+                val currentStepCount = lastStepCount ?: 0 // Use 0 or another default if no step count is available yet
+                val csvData = "$tagId,$currentStepCount,${Date().time},\"${shortArray.joinToString(",")}\""
                 try {
-                    Log.d(TAG, "Attempting to write to file: $csvData")
+                    Log.d(TAG, "Logging sensor data to CSV: $csvData")
                     file?.appendText("$csvData\n")
-                    Log.d(TAG, "Successfully wrote to file.")
                 } catch (e: IOException) {
                     Log.e(TAG, "Error writing to file", e)
                 }
-
-                uiScanResults.find { it.scanResult.device.name == gatt.device.name }
-                    ?.let {
-                        it.udpMessage.put("d", JSONArray(shortArray))
-                            .put("g", 2)
-                            .put("a", 1)
-                            .put("f", 25)
-                            .put("t", Date().time)
-                        sendUdpMessage(it.udpMessage)
-                    }
             }
         }
 
+
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            with(gatt) {
-                Log.w(
-                    "onServicesDiscovered",
-                    "Discovered ${services.size} services for ${device.address}"
-                )
-                if (services.isNotEmpty()) {
-                    services.find {
-                        it.uuid.toString() == SERVICE_UUID
-                    }?.characteristics?.find {
-                        it.uuid.toString() == SENSOR_READ
-                    }?.let { bluetoothGattCharacteristic ->
-                        Log.w(
-                            "onServicesDiscovered",
-                            "Found characteristic ${bluetoothGattCharacteristic.uuid} and its readable: ${bluetoothGattCharacteristic.isReadable()}  writable: ${bluetoothGattCharacteristic.isWritable()} writableWithoutResponse: ${bluetoothGattCharacteristic.isWritableWithoutResponse()}  notify: ${bluetoothGattCharacteristic.isNotifiable()}"
-                        )
-                        bluetoothGattCharacteristic.descriptors.forEach {
-                            Log.w(
-                                "onServicesDiscovered",
-                                "Found descriptor ${it.uuid} and its ${it.permissions}"
-                            )
-                            enableNotifications(bluetoothGattCharacteristic, it.uuid)
+            super.onServicesDiscovered(gatt, status)
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                val service = gatt.getService(UUID.fromString(SERVICE_UUID))
+                service?.let {
+                    it.characteristics.forEach { characteristic ->
+                        if (characteristic.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) {
+                            // Add to the queue
+                            pendingCharacteristicNotifications.add(characteristic.uuid)
                         }
                     }
                 }
+                // Start processing if not already started
+                if (!isProcessingCharacteristicNotification && pendingCharacteristicNotifications.isNotEmpty()) {
+                    processNextCharacteristicForNotification(gatt)
+                }
             }
         }
+        private fun processNextCharacteristicForNotification(gatt: BluetoothGatt) {
+            if (pendingCharacteristicNotifications.isEmpty()) {
+                isProcessingCharacteristicNotification = false
+                return
+            }
+
+            isProcessingCharacteristicNotification = true
+            val characteristicUuid = pendingCharacteristicNotifications.poll()
+            val service = gatt.getService(UUID.fromString(SERVICE_UUID))
+            val characteristic = service?.getCharacteristic(characteristicUuid)
+
+            characteristic?.let {
+                val cccdUuid = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+                enableNotifications(it, cccdUuid)            }
+        }
+
+
 
 
         private fun BluetoothGatt.printGattTable(): Boolean {
@@ -432,8 +432,14 @@ class BluetoothService(bluetoothAdapter: BluetoothAdapter, private val context: 
 
         fun enableNotifications(characteristic: BluetoothGattCharacteristic, descriptor: UUID) {
             val payload = when {
-                characteristic.isIndictable() -> BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
-                characteristic.isNotifiable() -> BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                characteristic.isIndictable() -> {
+                    Log.d(TAG, "Characteristic ${characteristic.uuid} is indictable")
+                    BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                }
+                characteristic.isNotifiable() -> {
+                    Log.d(TAG, "Characteristic ${characteristic.uuid} is notifiable")
+                    BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                }
                 else -> {
                     Log.e(
                         "enableNotifications",
@@ -444,17 +450,14 @@ class BluetoothService(bluetoothAdapter: BluetoothAdapter, private val context: 
             }
 
             characteristic.getDescriptor(descriptor)?.let { cccDescriptor ->
-                if (currentBluetoothGatt?.setCharacteristicNotification(
-                        characteristic,
-                        true
-                    ) == false
-                ) {
+                if (currentBluetoothGatt?.setCharacteristicNotification(characteristic, true) == false) {
                     Log.e(
                         "enableNotifications",
                         "setCharacteristicNotification failed for ${characteristic.uuid}"
                     )
                     return
                 }
+                Log.d(TAG, "setCharacteristicNotification succeeded for ${characteristic.uuid}")
                 writeDescriptor(cccDescriptor, payload)
             } ?: Log.e(
                 "enableNotifications",
@@ -463,10 +466,10 @@ class BluetoothService(bluetoothAdapter: BluetoothAdapter, private val context: 
         }
 
         fun writeDescriptor(descriptor: BluetoothGattDescriptor, payload: ByteArray) {
-            currentBluetoothGatt?.let { gatt ->
-                descriptor.value = payload
-                gatt.writeDescriptor(descriptor)
-            } ?: error("Not connected to a BLE device!")
+            descriptor.value = payload
+            currentBluetoothGatt?.writeDescriptor(descriptor)?.let {
+                Log.d(TAG, "Writing descriptor ${descriptor.uuid}")
+            } ?: Log.e(TAG, "Error when writing descriptor ${descriptor.uuid}")
         }
 
         fun BluetoothGattCharacteristic.isReadable(): Boolean =
